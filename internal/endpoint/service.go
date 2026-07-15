@@ -1,6 +1,7 @@
 package endpoint
 
 import (
+	"NodePassDash/internal/db/dialect"
 	"NodePassDash/internal/models"
 	"NodePassDash/internal/nodepass"
 	"errors"
@@ -15,6 +16,12 @@ import (
 // Service 端点管理服务
 type Service struct {
 	db *gorm.DB
+}
+
+var optionalEndpointCleanupTables = []string{
+	"traffic_archive_records",
+	"status_change_records",
+	"traffic_history",
 }
 
 // NewService 创建端点服务实例
@@ -374,19 +381,12 @@ func (s *Service) DeleteEndpoint(id int64) error {
 			}
 		}
 
-		// 7) 删除流量归档记录（如果存在）
-		if err := tx.Exec("DELETE FROM traffic_archive_records WHERE endpoint_id = ?", id).Error; err != nil {
-			// 这个表可能不存在，忽略错误
-		}
-
-		// 8) 删除状态变化记录（如果存在）
-		if err := tx.Exec("DELETE FROM status_change_records WHERE endpoint_id = ?", id).Error; err != nil {
-			// 这个表可能不存在，忽略错误
-		}
-
-		// 9) 删除流量历史记录（如果存在）
-		if err := tx.Exec("DELETE FROM traffic_history WHERE endpoint_id = ?", id).Error; err != nil {
-			// 这个表可能不存在，忽略错误
+		// 7-9) 删除可选历史/归档表记录。PG 事务中不能先触发缺表错误再忽略，
+		// 否则后续 SQL 会进入 current transaction is aborted 状态。
+		for _, tableName := range optionalEndpointCleanupTables {
+			if err := deleteEndpointRowsIfTableExists(tx, tableName, id); err != nil {
+				return err
+			}
 		}
 
 		// 10) 删除端点
@@ -403,6 +403,34 @@ func (s *Service) DeleteEndpoint(id int64) error {
 
 		return nil
 	})
+}
+
+func deleteEndpointRowsIfTableExists(tx *gorm.DB, tableName string, endpointID int64) error {
+	exists, err := tableExists(tx, tableName)
+	if err != nil {
+		return fmt.Errorf("检查表 %s 是否存在失败: %v", tableName, err)
+	}
+	if !exists {
+		return nil
+	}
+
+	if err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE endpoint_id = ?", tableName), endpointID).Error; err != nil {
+		return fmt.Errorf("删除 %s 记录失败: %v", tableName, err)
+	}
+	return nil
+}
+
+func tableExists(tx *gorm.DB, tableName string) (bool, error) {
+	d := dialect.For(tx.Dialector.Name())
+	if d == nil {
+		return tx.Migrator().HasTable(tableName), nil
+	}
+
+	var count int64
+	if err := tx.Raw(d.TableExistsSQL(tableName)).Scan(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // UpdateEndpointStatus 更新端点状态
